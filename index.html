@@ -752,7 +752,7 @@ function audioUpdate(dt){
     AU.pg.gain.setTargetAtTime(pour*(.18+.1*(S.sg&&S.sg.k<1?1:0)),t,.08);
     AU.pf.frequency.setTargetAtTime(500+900*S.D+300*(1-S.pq),t,.1);
     AU.fg.gain.setTargetAtTime(.28*Math.min(1,S.surge)*(S.state==='intro'?0:1),t,.3);
-    if(S.drinking){gulpT-=dt;if(gulpT<=0){gulp();gulpT=.55+Math.random()*.2;}}else gulpT=0;
+    if(S.drinking&&(S.state==='ready'||S.state==='result')){gulpT-=dt;if(gulpT<=0){gulp();gulpT=.55+Math.random()*.2;}}else gulpT=0;
   }
   // haptics: a gentle rumble while pouring and while the surge is strong
   buzzT-=dt;if(buzzT<=0){const lvl=(S.state==='pouring'||S.state==='topping')?S.pour:S.surge>.5?.5:0;if(lvl>0){buzz(Math.round(8+10*lvl));buzzT=.14;}}
@@ -811,7 +811,7 @@ function tick(dt,skip){
       const x=.5+(Math.random()-.5)*.25,y=(L.gb+S.D*L.gh)/L.H;
       splat(vel,x,y,(Math.random()-.5)*4,-2,0,.0014);
       if(S.state==='result')placeLines();
-      if(S.D<=.041){ if(S.state==='ready'){lock();} setState('empty');msg.textContent=(S.state==='empty'&&save.pints?msg.textContent.split('\n')[0]+'\n':'')+'Empty. Sláinte! 🍺';buzz(200);}
+      if(S.D<=.041){ if(S.state==='ready'){lock();} S.drinking=false;setState('empty');msg.textContent=(S.state==='empty'&&save.pints?msg.textContent.split('\n')[0]+'\n':'')+'Empty. Sláinte! 🍺';buzz(200);}
     }else{
       S.hold=0;
       if(S.drinking){S.drinking=false;if(S.state==='ready'&&S.sipped)lock();}
