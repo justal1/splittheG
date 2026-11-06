@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Split the G</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#050806">
+<meta name="mobile-web-app-capable" content="yes">
+<style>
+  :root{--gold:#d9b45a;--cream:#f3e6c8;--ink:#0b0907}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+  html,body{margin:0;height:100%;background:#050806;overflow:hidden;touch-action:none;
+    font-family:Georgia,'Times New Roman',serif;color:var(--cream)}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hud{position:fixed;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between;
+    padding:max(14px,env(safe-area-inset-top)) 18px max(18px,env(safe-area-inset-bottom))}
+  #top{text-align:center}
+  h1{margin:0;font-size:clamp(18px,5.4vw,26px);letter-spacing:.14em;font-weight:700;color:var(--gold);
+    text-shadow:0 2px 12px rgba(0,0,0,.8)}
+  #stats{font-size:12px;letter-spacing:.12em;opacity:.7;margin-top:4px;text-transform:uppercase}
+  #msg{margin-top:6px;font-size:clamp(13px,3.8vw,17px);min-height:2.4em;line-height:1.3;
+    text-shadow:0 2px 10px rgba(0,0,0,.9)}
+  #bottom{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .row{display:flex;gap:10px;width:100%;max-width:440px}
+  button{pointer-events:auto;font:inherit;color:var(--ink);background:linear-gradient(#e8c871,#b98d32);
+    border:0;border-radius:999px;padding:16px 20px;font-weight:700;letter-spacing:.12em;font-size:16px;
+    box-shadow:0 6px 20px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.5);touch-action:none}
+  button:active,button.on{filter:brightness(1.15);transform:translateY(1px)}
+  #main{flex:1;padding:16px 20px;font-size:18px}
+  .alt{flex:1;background:rgba(20,18,14,.75);color:var(--gold);border:1px solid rgba(217,180,90,.5);box-shadow:none;padding:10px 10px;font-size:12px}
+  .hidden{display:none!important}
+  .line{position:fixed;left:0;right:0;height:0;border-top:2px dashed;pointer-events:none;display:none}
+  #lt{border-color:#e8c871}
+  #lp{border-color:#fff}
+  .tag{position:absolute;right:8px;top:-18px;font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+  #lt .tag{color:#e8c871}#lp .tag{color:#fff;top:4px}
+  #rot{position:fixed;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:30px;background:#050806;z-index:8;color:var(--gold);font-size:20px;letter-spacing:.08em}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:30px;background:#050806;z-index:9}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="line" id="lt"><span class="tag">middle of the G</span></div>
+<div class="line" id="lp"><span class="tag">you</span></div>
+<div id="hud">
+  <div id="top">
+    <h1>SPLIT THE G</h1>
+    <div id="stats"></div>
+    <div id="msg"></div>
+  </div>
+  <div id="bottom">
+    <div class="row">
+      <button id="main">POUR A PINT</button>
+    </div>
+    <div class="row">
+      <button class="alt" id="mode">CONTROL: BUTTON</button>
+      <button class="alt hidden" id="again">NEW PINT</button>
+    </div>
+  </div>
+</div>
+<div id="rot">Turn your phone upright.<br>(Or switch on rotation lock.)</div>
+<div id="err">This device's WebView doesn't support WebGL2, which the fluid simulation needs.</div>
+
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const canvas=$('c');
+const gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,powerPreference:'high-performance'});
+if(!gl||!(gl.getExtension('EXT_color_buffer_float')||gl.getExtension('EXT_color_buffer_half_float'))){
+  $('err').style.display='flex'; throw new Error('no webgl2');
+}
+gl.getExtension('OES_texture_float_linear');
+
+const Q=new URLSearchParams(location.search);
+const SIM_RES=128, DYE_RES=Q.get('lo')?256:512, PRESSURE_ITER=18;
+const GC=0.52;            // middle of the G, as a fraction of glass height
+const GLASS_MM=150;       // pint glass height, for error in mm
+const FILL=0.86, HEAD0=0.10;
+
+/* ---------- shaders ---------- */
+const HEAD='#version 300 es\nprecision highp float;precision highp sampler2D;\n';
+const VS=HEAD+`in vec2 aPosition;out vec2 vUv,vL,vR,vT,vB;uniform vec2 texelSize;
+void main(){vUv=aPosition*.5+.5;vL=vUv-vec2(texelSize.x,0.);vR=vUv+vec2(texelSize.x,0.);
+vT=vUv+vec2(0.,texelSize.y);vB=vUv-vec2(0.,texelSize.y);gl_Position=vec4(aPosition,0.,1.);}`;
+
+const GLASS=`
+uniform vec2 uRes;uniform vec4 uGlass;uniform float uHwTop,uWall,uBase,uD,uH,uTime,uTan;
+float hwAt(float v){return mix(uGlass.w,uHwTop,v);}
+float vAt(vec2 p){return (p.y-uGlass.y)/uGlass.z;}
+float inside(vec2 uv){vec2 p=uv*uRes;float v=vAt(p);
+  return step(abs(p.x-uGlass.x),hwAt(v)-uWall)*step(uBase,v)*step(v,1.);}
+float hash(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
+float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+  return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);}
+float fbm(vec2 p){float a=.5,s=0.;for(int i=0;i<4;i++){s+=a*vnoise(p);p*=2.03;a*=.5;}return s;}
+`;
+
+const F={};
+F.splat=HEAD+`in vec2 vUv;uniform sampler2D uTarget;uniform float aspect,radius;uniform vec3 color;uniform vec2 point;out vec4 o;
+void main(){vec2 p=vUv-point;p.x*=aspect;vec3 s=exp(-dot(p,p)/radius)*color;o=vec4(texture(uTarget,vUv).xyz+s,1.);}`;
+
+F.advect=HEAD+GLASS+`in vec2 vUv;uniform sampler2D uVelocity,uSource;uniform vec2 texelSize;uniform float dt,diss,dissG;out vec4 o;
+void main(){vec2 c=vUv-dt*texture(uVelocity,vUv).xy*texelSize;
+vec4 s=texture(uSource,c);o=vec4(s.r/(1.+diss*dt),s.g/(1.+dissG*dt),s.b,1.);o*=inside(vUv);}`;
+
+F.curl=HEAD+`in vec2 vUv,vL,vR,vT,vB;uniform sampler2D uVelocity;out vec4 o;
+void main(){float L=texture(uVelocity,vL).y,R=texture(uVelocity,vR).y,T=texture(uVelocity,vT).x,B=texture(uVelocity,vB).x;
+o=vec4(.5*(R-L-T+B),0.,0.,1.);}`;
+
+F.vort=HEAD+`in vec2 vUv,vL,vR,vT,vB;uniform sampler2D uVelocity,uCurl;uniform float curl,dt;out vec4 o;
+void main(){float L=texture(uCurl,vL).x,R=texture(uCurl,vR).x,T=texture(uCurl,vT).x,B=texture(uCurl,vB).x,C=texture(uCurl,vUv).x;
+vec2 f=.5*vec2(abs(T)-abs(B),abs(R)-abs(L));f/=length(f)+1e-4;f*=curl*C;f.y*=-1.;
+vec2 v=texture(uVelocity,vUv).xy+f*dt;o=vec4(clamp(v,-1000.,1000.),0.,1.);}`;
+
+F.div=HEAD+`in vec2 vUv,vL,vR,vT,vB;uniform sampler2D uVelocity;out vec4 o;
+void main(){float L=texture(uVelocity,vL).x,R=texture(uVelocity,vR).x,T=texture(uVelocity,vT).y,B=texture(uVelocity,vB).y;
+vec2 C=texture(uVelocity,vUv).xy;
+if(vL.x<0.)L=-C.x;if(vR.x>1.)R=-C.x;if(vT.y>1.)T=-C.y;if(vB.y<0.)B=-C.y;
+o=vec4(.5*(R-L+T-B),0.,0.,1.);}`;
+
+F.clear=HEAD+`in vec2 vUv;uniform sampler2D uTexture;uniform float value;out vec4 o;
+void main(){o=value*texture(uTexture,vUv);}`;
+
+F.press=HEAD+`in vec2 vUv,vL,vR,vT,vB;uniform sampler2D uPressure,uDivergence;out vec4 o;
+void main(){float L=texture(uPressure,vL).x,R=texture(uPressure,vR).x,T=texture(uPressure,vT).x,B=texture(uPressure,vB).x;
+float d=texture(uDivergence,vUv).x;o=vec4((L+R+B+T-d)*.25,0.,0.,1.);}`;
+
+F.grad=HEAD+`in vec2 vUv,vL,vR,vT,vB;uniform sampler2D uPressure,uVelocity;out vec4 o;
+void main(){float L=texture(uPressure,vL).x,R=texture(uPressure,vR).x,T=texture(uPressure,vT).x,B=texture(uPressure,vB).x;
+vec2 v=texture(uVelocity,vUv).xy-vec2(R-L,T-B);o=vec4(v,0.,1.);}`;
+
+/* the Guinness "surge": bubbles stream DOWN the walls, drift UP the middle */
+F.force=HEAD+GLASS+`in vec2 vUv;uniform sampler2D uVelocity;uniform float dt,uSurge,uPour,uAccel,uJetX,uJetK;out vec4 o;
+void main(){vec2 vel=texture(uVelocity,vUv).xy;vec2 p=vUv*uRes;float v=vAt(p);
+float sg=(p.x-uGlass.x)/hwAt(v);float s=abs(sg);
+float liq=step(v,uD)*step(uBase,v);
+float down=smoothstep(.40,.92,s),up=1.-smoothstep(0.,.5,s);
+float fx0=0.;
+float fy=(-down*1.+up*.62)*16.*uSurge;
+float jet=(1.-smoothstep(0.,.30,abs(sg-uJetX)))*smoothstep(uD-.55,uD,v);
+fy+=-150.*uPour*uJetK*jet;
+// turbulent churn: big noisy forces everywhere under the surface while pouring
+vec2 tq=vec2(p.x*.012,p.y*.012);
+float tn1=vnoise(tq+vec2(uTime*.9,0.))-.5,tn2=vnoise(tq*1.7+vec2(5.,-uTime*1.3))-.5;
+fy+=tn1*130.*uPour*(.35+.65*uJetK);fx0=tn2*130.*uPour*(.35+.65*uJetK);
+// wobble sideways so the sheets of bubbles curl
+float fx=(vnoise(vec2(v*9.,uTime*.4))-.5)*10.*uSurge*(.4+down);
+vel+=vec2(fx+fx0,fy)*liq*dt;vel.x+=uAccel*dt*step(uBase,v);
+o=vec4(vel,0.,1.);}`;
+
+F.inject=HEAD+GLASS+`in vec2 vUv;uniform sampler2D uDye;uniform float dt,uSurge,uPour,uJetX,uJetK;out vec4 o;
+void main(){vec4 c=texture(uDye,vUv);vec2 p=vUv*uRes;float v=vAt(p);
+float s=(p.x-uGlass.x)/hwAt(v);
+// foam: carried by the flow, slowly relaxes back to a level head sitting on the beer
+float top=uD+uH;
+float T=step(uD,v)*step(v,top);
+float k=v<uD?.9:(v>top?3.5:1.4);
+c.g+=(T-c.g)*min(1.,k*dt);
+// cascade bubbles under the head
+float band=smoothstep(uD-.30,uD-.01,v)*step(v,uD);
+float n=fbm(p*.045+vec2(uTime*.12,-uTime*.7));
+c.r+=uSurge*band*smoothstep(.38,.78,n)*dt*3.2*(.5+.8*abs(s));
+float jx=(1.-smoothstep(0.,.45,abs(s-uJetX)))*uJetK;
+c.r+=uPour*smoothstep(uD-.6,uD,v)*step(v,uD)*dt*(7.*jx+2.5*smoothstep(.2,.7,n))*(.6+.8*vnoise(p*.03+uTime));
+o=vec4(min(c.r,1.4),clamp(c.g,0.,1.),0.,1.);}`;
+
+F.display=HEAD+GLASS+`in vec2 vUv;uniform sampler2D uDye,uG;uniform float uMaxTop,uGs,uSurge,uPour;uniform vec2 uGc;uniform sampler2D uLace;uniform vec4 uRot,uStream,uStream2;uniform float uSW;uniform float uWave[24];out vec4 o;
+// clinging bubbles: returns (fill alpha, specular)
+vec2 beads(vec2 p,float cell,float dens,float seed){
+  vec2 q=p/cell,g=floor(q),f=fract(q);
+  if(hash(g+seed)>dens)return vec2(0.);
+  vec2 c=vec2(hash(g+seed+1.3),hash(g+seed+5.1))*.6+.2;
+  float r=.16+.26*hash(g+seed+9.7);
+  vec2 dv=(f-c)/r;float d=length(dv);
+  float fill=smoothstep(1.,.78,d);
+  float spec=smoothstep(.45,.0,length(dv-vec2(-.35,.4)))*fill;
+  return vec2(fill*(.55+.35*smoothstep(.55,1.,d)),spec);
+}
+vec3 bg(vec2 p){
+  vec2 uv=p/uRes;
+  vec3 wall=mix(vec3(.010,.030,.022),vec3(.030,.075,.052),smoothstep(0.,1.,uv.y))*(1.-.5*length(uv-.5));
+  // warm pub bokeh
+  for(int i=0;i<9;i++){float fi=float(i);
+    vec2 c=vec2(hash(vec2(fi,1.3)),.35+.65*hash(vec2(fi,7.1)))*uRes;
+    float r=uRes.x*(.05+.07*hash(vec2(fi,3.3)));
+    float a=smoothstep(r,r*.82,length(p-c));
+    wall+=a*vec3(.55,.34,.12)*(.05+.06*hash(vec2(fi,9.7)));}
+  // bar top
+  float tl=uGlass.y+.012*uGlass.z;
+  if(p.y<tl){float t=clamp((tl-p.y)/tl,0.,1.);
+    vec3 wood=mix(vec3(.17,.085,.045),vec3(.035,.02,.012),pow(t,.6));
+    wood*=.85+.3*fbm(vec2(p.x*.004,p.y*.05));
+    wood+=vec3(.5,.3,.12)*.05*exp(-abs(p.y-tl)*.05/uRes.x*400.);
+    // soft shadow + glow under glass
+    float sh=exp(-pow((p.x-uGlass.x)/(uGlass.w*1.5),2.)-pow((p.y-tl+uGlass.z*.01)/(uGlass.z*.05),2.));
+    wood*=1.-.75*sh;wall=wood;}
+  return wall;}
+float waveAt(float x){float u=(clamp(x,-1.,1.)*.5+.5)*23.;int i=int(floor(u));float f=fract(u);int j=min(i+1,23);return mix(uWave[i],uWave[j],f);}
+// one foam material shared by the head and the lacing on the glass
+vec3 cells(vec2 p){vec2 q=p/(uHwTop*.03);vec2 iq=floor(q),fq=fract(q);float md=8.,md2=8.,cid=0.;
+  for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 g=vec2(float(x),float(y));
+    vec2 o=vec2(hash(iq+g),hash(iq+g+17.3));float d=length(g+o-fq);
+    if(d<md){md2=md;md=d;cid=hash(iq+g+3.7);}else if(d<md2)md2=d;}
+  return vec3(md2-md,md,cid);}
+vec3 foamMat(vec2 p,float rim,float body,vec3 lo){
+  vec3 cl=cells(p);float wall=smoothstep(.0,.16,cl.x);
+  vec3 c=mix(lo,vec3(.95,.89,.77),body);
+  c*=.90+.10*wall;
+  c+=vec3(.05)*smoothstep(.45,.0,cl.y);
+  c*=.80+.20*(1.-rim);
+  c+=(vnoise(p*.35)-.5)*.07+(vnoise(p*.9)-.5)*.04;
+  return c;}
+void main(){
+  vec2 pw=vUv*uRes;vec2 p=pw;                       // the glass stays put on screen (the phone is the glass)
+  vec2 d0=pw-uRot.xy;vec2 pb=uRot.xy+vec2(uRot.z*d0.x+uRot.w*d0.y,-uRot.w*d0.x+uRot.z*d0.y);  // the room tilts around it
+  float v=vAt(p);float hw=hwAt(v);
+  vec3 col=bg(pb);
+  float px=1./uGlass.z;
+  if(v>=0.&&v<=1.&&abs(p.x-uGlass.x)<=hw){
+    float inner=hw-uWall;float sx=(p.x-uGlass.x)/inner;float asx=abs(sx);
+    float dvs=uTan*(p.x-uGlass.x)/uGlass.z;
+    float wvv=waveAt(sx)+.016*pow(asx,7.);          // live ripples + meniscus climbing the glass
+    float vs=v-dvs-wvv;
+    vec2 suv=p/uRes-vec2(0.,(dvs+wvv)*uGlass.z/uRes.y);
+    float wallZ=step(1.,asx);
+    vec3 c;
+    // ---- glass wall / base
+    if(wallZ>.5||v<uBase){
+      c=mix(col,vec3(.62,.78,.74),.30)+vec3(.05);
+      if(v<uBase)c=mix(c,vec3(.04,.03,.02),.45*smoothstep(.0,uBase,v)) + .05*(1.-v/uBase);
+    } else {
+      float wob=(fbm(p*.011+vec2(0.,uTime*.06))-.5)*.0018;
+      float lvl=uD+wob;
+      float rim=pow(clamp(asx,0.,1.),3.);
+      // dark ruby stout
+      vec3 stout=mix(vec3(.010,.006,.005),vec3(.26,.075,.028),pow(clamp(asx,0.,1.),2.2)*.9);
+      float dsurf=max(uD-vs,0.);
+      stout=mix(vec3(.105,.034,.014),stout,smoothstep(.0,.07,dsurf));   // thin backlit ruby layer under the surface
+      stout+=vec3(.03,.018,.01)*(1.-v)*.4;
+      vec2 dv=texture(uDye,suv).rg;float d=dv.x,f=dv.y;
+      float dd=smoothstep(.04,.95,d);
+      vec3 bubble=mix(vec3(.30,.18,.09),vec3(.92,.80,.60),dd);
+      vec3 liquid=mix(stout,bubble,dd*.92);
+      // head = foam field (deforms with the flow)
+      float top=uD+uH+.012*(1.-sx*sx)+wob*.6;
+      float headM=smoothstep(.36,.64,f);
+      float hv=clamp((vs-lvl)/max(uH,.001),0.,1.);
+      vec3 cream=vec3(.95,.89,.77);
+      float hb=smoothstep(0.,.42,hv)*.7+smoothstep(.45,.95,f)*.3;
+      vec3 hc=foamMat(p,rim,hb,vec3(.50,.35,.21));
+      hc=mix(vec3(.42,.28,.16),hc,smoothstep(.5,.9,f));   // thin/stretched foam is darker
+      hc=mix(hc,vec3(1.),smoothstep(.88,1.,hv)*.25);
+      c=liquid;
+      c=mix(c,hc,headM);
+      c+=vec3(.36,.30,.24)*smoothstep(.005,.0,abs(vs-uD))*.22*(1.-headM)*step(.002,uD);   // sheen on the open surface
+      // empty glass above the beer
+      float empty=step(lvl,vs)*(1.-headM);
+      c=mix(c,col+vec3(.025,.035,.03),empty);
+      // lacing left on the wall by the head
+      // lacing: creamy micro-bubble film clinging to the glass (CPU film simulation)
+      vec2 lt=vec2((p.x-uGlass.x)/uHwTop*.5+.5,(p.y-uGlass.y)/(uHwTop*3.9));
+      float lf=texture(uLace,lt).r*1.7;
+      if(lf>.03){
+        vec3 cl=cells(p);
+        float thick=lf*(.72+.56*cl.z);
+        float alpha=smoothstep(.47,.53,thick);          // foam or nothing: crisp, bubble-scalloped edge
+        vec3 lc=foamMat(p,rim,.88,vec3(.62,.48,.32));   // same foam as the head
+        lc=mix(lc,vec3(1.,.98,.93),smoothstep(.9,1.5,lf)*.25);
+        c=mix(c,lc,alpha);
+      }
+    }
+    // glass highlights
+    float hl=smoothstep(.07,.0,abs(sx+.80))*.12+smoothstep(.04,.0,abs(sx-.86))*.16+smoothstep(.02,.0,abs(sx+.62))*.05;
+    c+=hl*vec3(.8,.9,.95)*(v>uBase?1.:.3);
+    c+=vec3(.5,.62,.6)*smoothstep(1.2*uWall,.0,abs(abs(p.x-uGlass.x)-hw))*.5;     // outline
+    c+=vec3(.6,.7,.7)*smoothstep(.006,.0,abs(v-1.))*.5;                               // rim
+    // printed G on the glass
+    vec2 gt=(p-uGc)/uGs+.5;
+    if(gt.x>0.&&gt.x<1.&&gt.y>0.&&gt.y<1.){vec4 g=texture(uG,gt);c=mix(c,g.rgb,g.a*.93);}
+    col=c;
+  }
+  if(uPour>.01){
+    // 1) the stream itself, falling in real-world vertical from beyond the top of the screen
+    vec2 sa=uStream.xy,sb=uStream.zw,ba=sb-sa;float l2=max(dot(ba,ba),1.);
+    float t=dot(pw-sa,ba)/l2;
+    if(t>0.&&t<1.){
+      vec2 cp=sa+ba*t;vec2 nr=normalize(vec2(-ba.y,ba.x));float ta=t*sqrt(l2);
+      float wob=sin(ta*.05+uTime*11.)*uSW*.03+sin(ta*.02-uTime*5.)*uSW*.05;
+      float dx=dot(pw-cp,nr)-wob;float w=uSW;
+      float a=smoothstep(w,w*.55,abs(dx))*uPour;
+      vec3 sc=vec3(.025,.012,.009)+vec3(.35,.12,.05)*smoothstep(-.9,-.2,dx/w)*smoothstep(.5,-.3,dx/w)*.5;
+      sc+=vec3(.7,.6,.5)*smoothstep(.25,.0,abs(dx/w+.45))*.35;
+      col=mix(col,sc,a*.96);}
+    // 2) where it hits the wall it runs down the glass to the beer
+    vec2 ra=uStream2.xy,rb=uStream2.zw,rd=rb-ra;float rl=dot(rd,rd);
+    if(rl>4.){float u=dot(pw-ra,rd)/rl;
+      if(u>0.&&u<1.){vec2 q=ra+rd*u;float dx=pw.x-q.x;float w=uSW*.42*(1.-.3*u);
+        float a=smoothstep(w,w*.5,abs(dx))*uPour*.85;
+        col=mix(col,vec3(.05,.025,.015)+vec3(.25,.1,.05)*smoothstep(.2,-.6,dx/w)*.5,a);}}
+  }
+  col+=(hash(p+uTime)-.5)/200.;
+  o=vec4(col,1.);}`;
+
+/* ---------- gl plumbing ---------- */
+const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+
+function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s)+'\n'+src.split('\n').map((l,i)=>(i+1)+': '+l).join('\n'));return s;}
+const vs=sh(gl.VERTEX_SHADER,VS);
+function prog(fsrc){const p=gl.createProgram();gl.attachShader(p,vs);gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fsrc));
+  gl.bindAttribLocation(p,0,'aPosition');gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));
+  const u={},n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);
+  for(let i=0;i<n;i++){const nm=gl.getActiveUniform(p,i).name;u[nm]=gl.getUniformLocation(p,nm);}
+  return {p,u};}
+const P={};for(const k in F)P[k]=prog(F[k]);
+
+let cur=null;
+function use(pr){cur=pr;gl.useProgram(pr.p);}
+function set1(n,v){if(cur.u[n]!==undefined)gl.uniform1f(cur.u[n],v);}
+function set2(n,a,b){if(cur.u[n]!==undefined)gl.uniform2f(cur.u[n],a,b);}
+function set3(n,a,b,c){if(cur.u[n]!==undefined)gl.uniform3f(cur.u[n],a,b,c);}
+function set4(n,a,b,c,d){if(cur.u[n]!==undefined)gl.uniform4f(cur.u[n],a,b,c,d);}
+function tex(n,t,unit){if(cur.u[n]!==undefined){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,t);gl.uniform1i(cur.u[n],unit);}}
+
+function fbo(w,h,filter){
+  const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);
+  const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  gl.viewport(0,0,w,h);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
+  return {t,f,w,h,tx:1/w,ty:1/h};}
+function dbl(w,h,filter){let a=fbo(w,h,filter),b=fbo(w,h,filter);
+  return {get read(){return a;},get write(){return b;},swap(){const x=a;a=b;b=x;},w,h,tx:1/w,ty:1/h};}
+function blit(target){
+  if(target){gl.viewport(0,0,target.w,target.h);gl.bindFramebuffer(gl.FRAMEBUFFER,target.f);}
+  else{gl.viewport(0,0,gl.drawingBufferWidth,gl.drawingBufferHeight);gl.bindFramebuffer(gl.FRAMEBUFFER,null);}
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);}
+
+function res(r){const a=canvas.width/canvas.height;return a<1?{w:r,h:Math.round(r/a)}:{w:Math.round(r*a),h:r};}
+
+let vel,dye,pressure,div,curlT,gtex;
+let L={}; // layout in canvas pixels
+
+function layout(){
+  const W=canvas.width,H=canvas.height;
+  const topPad=.14*H,botPad=.165*H,avail=H-topPad-botPad;
+  const hwTop=Math.min(.47*W,avail/3.9),gh=hwTop*3.9;
+  const gb=botPad+(avail-gh)/2;
+  L={W,H,cx:W/2,gb,gh,hwTop,hwBot:hwTop*.8,wall:Math.max(4,.022*hwTop),base:.05,gs:.125*gh};
+}
+function setGlass(){
+  set2('uRes',L.W,L.H);set4('uGlass',L.cx,L.gb,L.gh,L.hwBot);set1('uHwTop',L.hwTop);
+  set1('uWall',L.wall);set1('uBase',L.base);set1('uD',S.D);set1('uH',S.H);set1('uTime',S.time);set1('uTan',Math.tan(S.ang||0));}
+
+function makeG(){
+  const c=document.createElement('canvas');c.width=c.height=512;const x=c.getContext('2d');
+  x.textAlign='center';x.textBaseline='middle';
+  x.font='bold 470px Georgia,"Times New Roman",serif';
+  x.lineJoin='round';x.lineWidth=16;x.strokeStyle='rgba(30,16,6,.55)';x.strokeText('G',256,282);
+  const g=x.createLinearGradient(0,60,0,460);g.addColorStop(0,'#fffaf0');g.addColorStop(1,'#efe2c0');
+  x.fillStyle=g;x.fillText('G',256,282);
+  // ruler tick to mark the exact middle
+  gtex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,gtex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,c);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+}
+
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const w=Math.max(2,Math.round(innerWidth*dpr)),h=Math.max(2,Math.round(innerHeight*dpr));
+  if(canvas.width===w&&canvas.height===h&&vel)return;
+  canvas.width=w;canvas.height=h;layout();
+  const s=res(SIM_RES),d=res(DYE_RES);
+  vel=dbl(s.w,s.h,gl.LINEAR);dye=dbl(d.w,d.h,gl.LINEAR);
+  pressure=dbl(s.w,s.h,gl.NEAREST);div=fbo(s.w,s.h,gl.NEAREST);curlT=fbo(s.w,s.h,gl.NEAREST);
+  placeLines();
+}
+addEventListener('resize',resize);
+
+/* ---------- simulation step ---------- */
+function splat(target,x,y,r,g,b,rad){
+  use(P.splat);tex('uTarget',target.read.t,0);set1('aspect',canvas.width/canvas.height);
+  set2('point',x,y);set3('color',r,g,b);set1('radius',rad);blit(target.write);target.swap();}
+
+function simStep(dt){
+  const sx=vel.tx,sy=vel.ty;
+  // surge forces
+  use(P.force);setGlass();set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);
+  set1('dt',dt);set1('uSurge',S.surge);set1('uPour',S.pour);set1('uAccel',S.accel||0);set1('uJetX',S.jetX||0);set1('uJetK',S.jetK==null?1:S.jetK);blit(vel.write);vel.swap();
+  use(P.curl);set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);blit(curlT);
+  use(P.vort);set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);tex('uCurl',curlT.t,1);set1('curl',26);set1('dt',dt);
+  blit(vel.write);vel.swap();
+  use(P.div);set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);blit(div);
+  use(P.clear);tex('uTexture',pressure.read.t,0);set1('value',.8);blit(pressure.write);pressure.swap();
+  use(P.press);set2('texelSize',sx,sy);tex('uDivergence',div.t,1);
+  for(let i=0;i<PRESSURE_ITER;i++){tex('uPressure',pressure.read.t,0);blit(pressure.write);pressure.swap();}
+  use(P.grad);set2('texelSize',sx,sy);tex('uPressure',pressure.read.t,0);tex('uVelocity',vel.read.t,1);blit(vel.write);vel.swap();
+  use(P.advect);setGlass();set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);tex('uSource',vel.read.t,1);
+  set1('dt',dt);set1('diss',1.0);set1('dissG',1.0);blit(vel.write);vel.swap();
+  use(P.inject);setGlass();tex('uDye',dye.read.t,0);set1('dt',dt);set1('uSurge',S.surge);set1('uPour',S.pour);set1('uJetX',S.jetX||0);set1('uJetK',S.jetK==null?1:S.jetK);blit(dye.write);dye.swap();
+  use(P.advect);setGlass();set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);tex('uSource',dye.read.t,1);
+  set1('dt',dt);set1('diss',.25+1.1*(1-S.surge));set1('dissG',.04);blit(dye.write);dye.swap();
+}
+
+function render(){
+  use(P.display);setGlass();if(cur.u['uWave[0]']!==undefined)gl.uniform1fv(cur.u['uWave[0]'],wOut);tex('uDye',dye.read.t,0);tex('uG',gtex,1);tex('uLace',laceTex,2);
+  set1('uMaxTop',S.maxTop);set4('uRot',L.cx,L.gb+.5*L.gh,Math.cos(S.gAng||0),Math.sin(S.gAng||0));{const g=S.sg||{x0:0,y0:0,x1:0,y1:0,rx0:0,ry0:0,rx1:0,ry1:0};set4('uStream',g.x0,g.y0,g.x1,g.y1);set4('uStream2',g.rx0,g.ry0,g.rx1,g.ry1);set1('uSW',L.hwTop*.07);}set1('uPour',S.pour);set1('uSurge',S.surge);set2('uGc',L.cx,L.gb+GC*L.gh);set1('uGs',L.gs);blit(null);}
+
+/* ---------- bubbles on the glass ---------- */
+const BW=320,BH=624,HT=3.9,UN=BW/2;           // glass units: 1 = half width at the top, height = 3.9
+const trailC=document.createElement('canvas'),beadC=document.createElement('canvas');
+trailC.width=beadC.width=BW;trailC.height=beadC.height=BH;
+const tctx=trailC.getContext('2d'),bctx=beadC.getContext('2d');
+function mkTex(){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,BW,BH,0,gl.RGBA,gl.UNSIGNED_BYTE,null);return t;}
+const trailTex=mkTex(),beadTex=mkTex();
+function upl(t,c){gl.bindTexture(gl.TEXTURE_2D,t);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,c);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);}
+function sprite(stops,hi){const c=document.createElement('canvas');c.width=c.height=64;const x=c.getContext('2d');
+  const g=x.createRadialGradient(32,32,2,32,32,31);stops.forEach(([o,col])=>g.addColorStop(o,col));
+  x.fillStyle=g;x.beginPath();x.arc(32,32,31,0,7);x.fill();
+  x.fillStyle=hi;x.beginPath();x.arc(23,22,8,0,7);x.fill();return c;}
+const sprFoam=sprite([[0,'rgba(255,248,232,.62)'],[.72,'rgba(243,229,198,.82)'],[.93,'rgba(140,110,70,.6)'],[1,'rgba(90,65,35,.0)']],'rgba(255,255,255,.75)');
+const sprLiq=sprite([[0,'rgba(235,185,120,.42)'],[.75,'rgba(215,160,100,.55)'],[.95,'rgba(110,70,35,.5)'],[1,'rgba(60,35,15,0)']],'rgba(255,240,215,.6)');
+let bub=[],prevTopY=0,spawnAcc=0,liqAcc=0,trailDirty=0,bubT=0;
+const rnd=Math.random;
+function hwU(Y){return .8+.2*(Y/HT)-L.wall/L.hwTop-.012;}
+function ySurf(X){return S.D*HT+Math.tan(S.ang||0)*X;}
+function clearBubbles(){bub=[];tctx.clearRect(0,0,BW,BH);bctx.clearRect(0,0,BW,BH);upl(trailTex,trailC);upl(beadTex,beadC);prevTopY=0;}
+function addBub(X,Y,r){if(bub.length<520)bub.push({x:X,y:Y,r,vy:0,rc:.03*(.7+.6*rnd()),age:0,sd:rnd()*6.3});}
+function bubbleStep(dt){
+  if(!L.hwTop)return;bubT+=dt;
+  const tn=Math.tan(S.ang||0);
+  // foam is left clinging above the beer as the head drops
+  if(S.state==='ready'||S.state==='result'||S.state==='empty'){
+    const topY=(S.D+S.H)*HT;
+    if(prevTopY>0&&topY<prevTopY){
+      spawnAcc+=(prevTopY-topY)*210;
+      while(spawnAcc>=1){spawnAcc--;const Y0=topY+rnd()*(prevTopY-topY);const X=(rnd()*2-1)*hwU(Y0);
+        addBub(X,Y0+tn*X*.5+.02,.005+.012*rnd()*rnd());}
+    }
+    prevTopY=topY;
+  }
+  // tiny bubbles forming on the glass under the surface during the surge
+  if(S.surge>.03&&S.state!=='intro'){
+    liqAcc+=(S.surge*38+S.pour*70)*dt;
+    while(liqAcc>=1){liqAcc--;const Y=.25+rnd()*Math.max(.05,S.D*HT-.35);const X=(rnd()*2-1)*hwU(Y);
+      if(Y<ySurf(X)-.05)addBub(X,Y,.004+.004*rnd());}
+  }
+  // move
+  for(const b of bub){
+    b.age+=dt;const Ys=ySurf(b.x);
+    b.liq=b.y<Ys;
+    if(b.liq){ // gas bead in the beer: clumped ones break away and rise into the head
+      const t=Math.max(0,b.r-.012);b.vy+=((.02+t*10)-b.vy)*Math.min(1,3*dt);
+      b.y+=b.vy*dt;b.x+=Math.sin(bubT*3+b.sd)*.01*dt;
+      if(b.y+b.r>=ySurf(b.x)){b.dead=true;}
+    }else{ // foam bead on dry glass: gets heavier as it drains, then slides
+      const rc=b.rc*(1-Math.min(.5,b.age/45));
+      const tgt=b.r>rc?-Math.min(.55,.25*(b.r-rc)*40+.04):(b.r>.012?-.004:0);
+      b.vy+=(tgt-b.vy)*Math.min(1,5*dt);
+      if(b.vy<-.002){const ox=b.x,oy=b.y;
+        b.y+=b.vy*dt;b.x+=Math.sin(bubT*.9+b.sd)*.0035*dt;
+        tctx.strokeStyle='rgba(236,222,190,.11)';tctx.lineCap='round';tctx.lineWidth=Math.max(1.2,b.r*UN*1.1);
+        tctx.beginPath();tctx.moveTo((ox+1)*UN,(HT-oy)/HT*BH);tctx.lineTo((b.x+1)*UN,(HT-b.y)/HT*BH);tctx.stroke();trailDirty=1;
+        if(b.y<ySurf(b.x)+b.r*.5)b.dead=true; // slid back into the beer
+      }
+    }
+    const lim=hwU(b.y);if(b.x>lim)b.x=lim;if(b.x<-lim)b.x=-lim;
+  }
+  // coalesce (spatial hash)
+  const grid=new Map(),CS=.07;
+  for(let i=0;i<bub.length;i++){const b=bub[i];if(b.dead)continue;const k=Math.floor(b.x/CS)*4096+Math.floor(b.y/CS);
+    let a=grid.get(k);if(!a)grid.set(k,a=[]);a.push(i);}
+  for(let i=0;i<bub.length;i++){const b=bub[i];if(b.dead)continue;
+    const cx=Math.floor(b.x/CS),cy=Math.floor(b.y/CS);
+    for(let ox=-1;ox<=1;ox++)for(let oy=-1;oy<=1;oy++){const a=grid.get((cx+ox)*4096+cy+oy);if(!a)continue;
+      for(const j of a){if(j<=i)continue;const o=bub[j];if(o.dead||b.dead||o.liq!==b.liq)continue;
+        const dx=o.x-b.x,dy=o.y-b.y,rr=(b.r+o.r)*.85;
+        if(dx*dx+dy*dy<rr*rr){
+          const A=b.r*b.r,B=o.r*o.r,t=A+B;
+          b.x=(b.x*A+o.x*B)/t;b.y=(b.y*A+o.y*B)/t;b.vy=(b.vy*A+o.vy*B)/t;
+          b.r=Math.min(.075,Math.sqrt(t));b.rc=(b.rc+o.rc)/2;b.age=Math.min(b.age,o.age);o.dead=true;}}}}
+  bub=bub.filter(b=>!b.dead);
+  // draw
+  bctx.clearRect(0,0,BW,BH);
+  for(const b of bub){const px=b.r*UN*2;const sp=b.liq?sprLiq:sprFoam;
+    bctx.drawImage(sp,(b.x+1)*UN-px/2,(HT-b.y)/HT*BH-px/2,px,px);}
+  upl(beadTex,beadC);
+  if(trailDirty&&((bubT*20|0)%3===0)){upl(trailTex,trailC);trailDirty=0;}
+  if((bubT*2|0)!==((bubT-dt)*2|0)){tctx.globalCompositeOperation='destination-out';tctx.fillStyle='rgba(0,0,0,.015)';tctx.fillRect(0,0,BW,BH);tctx.globalCompositeOperation='source-over';trailDirty=1;}
+}
+
+/* ---------- lacing film ---------- */
+const FW=192,FH=374;
+const film=new Float32Array(FW*FH),up8=new Uint8Array(FW*FH),fnz=new Float32Array(FW*FH),fnl=new Float32Array(FW*FH);
+(function(){const g=(n)=>{const a=new Float32Array(n);for(let i=0;i<n;i++)a[i]=Math.random();return a;};
+  const w1=g(40*80),w2=g(16*32),w3=g(7*14);
+  const bl=(w,gw,gh,x,y)=>{const fx=x*(gw-1),fy=y*(gh-1),ix=fx|0,iy=fy|0,tx=fx-ix,ty=fy-iy;
+    return (w[iy*gw+ix]*(1-tx)+w[iy*gw+Math.min(gw-1,ix+1)]*tx)*(1-ty)+(w[Math.min(gh-1,iy+1)*gw+ix]*(1-tx)+w[Math.min(gh-1,iy+1)*gw+Math.min(gw-1,ix+1)]*tx)*ty;};
+  for(let j=0;j<FH;j++)for(let i=0;i<FW;i++){fnz[j*FW+i]=.6*bl(w1,40,80,i/FW,j/FH)+.4*bl(w2,16,32,i/FW,j/FH);fnl[j*FW+i]=bl(w3,7,14,i/FW,j/FH);}})();
+const laceTex=(()=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R8,FW,FH,0,gl.RED,gl.UNSIGNED_BYTE,up8);return t;})();
+const colPrev=new Float32Array(FW);let fPrev=0,fFrame=0;
+function clearFilm(){film.fill(0);up8.fill(0);colPrev.fill(0);fPrev=0;gl.bindTexture(gl.TEXTURE_2D,laceTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R8,FW,FH,0,gl.RED,gl.UNSIGNED_BYTE,up8);}
+function filmStep(dt){
+  if(!L.hwTop)return;
+  const tn=Math.tan(S.ang||0),HTy=HT/FH;
+  const hasHead=S.state==='resting'||S.state==='topping'||S.state==='ready'||S.state==='result'||S.state==='empty';
+  const base=(S.D+S.H)*HT,CLIMB=.26,cr=Math.ceil(CLIMB/HTy);
+  for(let i=0;i<FW;i++){
+    const X=(i+.5)/FW*2-1,topC=hasHead?base+tn*X:S.D*HT+tn*X;
+    const jTop=Math.max(0,Math.min(FH-1,Math.floor(topC/HTy)));
+    if(hasHead){
+      const lim=hwU(topC),wallF=Math.max(0,Math.min(1,(Math.abs(X)/lim-.6)/.38)),ww=wallF*wallF*(3-2*wallF);
+      const prev=colPrev[i],sw=smooth(-.75,.7,X*(S.lipSide||1));   // lacing collects on the side you drink from
+      // 1) foam climbs the glass from the edge of the head (strongest at the walls)
+      if(ww>0&&Math.abs(X)<lim){
+        for(let u=0;u<cr&&jTop+u<FH;u++){const k=(jTop+u)*FW+i,t=u/cr,fv=ww*Math.pow(1-t,1.6)*(.5+.5*fnz[k])*(.65+.35*S.surge)*.95*sw*smooth(.18,.45,fnl[k]);
+          if(fv>film[k])film[k]=fv;}
+      }
+      // 2) wherever the head slides back down it leaves a film (drinking, and sloshing as the glass tilts)
+      if(prev>0&&topC<prev){
+        const drop=Math.min(1,(prev-topC)*3),jp=Math.min(FH-1,Math.ceil(prev/HTy));
+        for(let j=jTop;j<=jp;j++){const k=j*FW+i,n=fnz[k];
+          if(n>.5){const fv=(.5+.5*(n-.5)/.5)*(.7+.3*drop)*sw*smooth(.18,.45,fnl[k]);if(fv>film[k])film[k]=fv;}}
+      }
+      // 3) ...and a heavier ring where it lingers
+      for(let u=0;u<cr/2&&jTop+u<FH;u++){const k=(jTop+u)*FW+i,t=u/(cr/2);
+        film[k]=Math.min(1.1,film[k]+dt*1.1*(1-t)*(.3+.9*fnz[k])*(Math.abs(X)<lim?1:0)*sw*smooth(.18,.45,fnl[k]));}
+      colPrev[i]=topC;
+    }
+    // the head / beer covers the film beneath it
+    for(let j=0;j<jTop;j++)film[j*FW+i]=0;
+  }
+  // drain: film thins slowly; thick patches creep down and merge into heavier blobs that run
+  const thin=1-.012*dt;
+  for(let j=FH-1;j>=1;j--){const row=j*FW;
+    for(let i=0;i<FW;i++){let f=film[row+i];if(f<.003)continue;
+      f*=thin;
+      if(f>.5){const m=(f-.5)*dt*.45;f-=m;
+        const ii=Math.max(0,Math.min(FW-1,i+(Math.random()<.2?(Math.random()<.5?-1:1):0)));film[row-FW+ii]+=m;}
+      film[row+i]=f<.003?0:(f>2?2:f);}}
+  if((fFrame++&1)===0){for(let k=0;k<up8.length;k++){const v=film[k]*150;up8[k]=v>255?255:v;}
+    gl.bindTexture(gl.TEXTURE_2D,laceTex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.R8,FW,FH,0,gl.RED,gl.UNSIGNED_BYTE,up8);}
+}
+
+/* ---------- surface waves ---------- */
+const NW=24,wh=new Float32Array(NW),wv=new Float32Array(NW),wOut=new Float32Array(NW);
+let lastAng=0;
+function waveStep(dt){
+  const sub=2,h=dt/sub,ang=S.ang||0,angV=(ang-lastAng)/Math.max(dt,1e-3);lastAng=ang;
+  for(let n=0;n<sub;n++){
+    for(let i=0;i<NW;i++){
+      const l=wh[i>0?i-1:1],r=wh[i<NW-1?i+1:NW-2],X=i/(NW-1)*2-1;
+      let a=190*(l+r-2*wh[i])-6*wh[i]-7*wv[i]+14*(wv[i>0?i-1:1]+wv[i<NW-1?i+1:NW-2]-2*wv[i]);
+      a+=-angV*X*.9+(S.accel||0)*X*.02;     // sloshes as the glass tilts
+      wv[i]+=a*h;
+    }
+    for(let i=0;i<NW;i++)wh[i]+=wv[i]*h;
+  }
+  for(let i=0;i<NW;i++){const m=.008;wOut[i]=Math.max(-m,Math.min(m,wh[i]));}
+}
+
+/* ---------- pouring geometry ---------- */
+// The world's vertical stream, seen in the glass's own frame: it arrives slanted by the tilt angle.
+function streamGeom(){
+  const th=S.gAng||0,dx=Math.sin(th),dy=-Math.cos(th);
+  const rx=L.cx,ry=L.gb+L.gh,tn=Math.tan(S.ang||0);
+  let entered=false,end=null,k=1,jx=0;
+  for(let t=2;t<2.6*L.gh;t+=3){
+    const x=rx+dx*t,y=ry+dy*t,v=(y-L.gb)/L.gh,hw=L.hwBot+(L.hwTop-L.hwBot)*v;
+    const inside=v>=0&&v<=1&&Math.abs(x-L.cx)<hw-L.wall;
+    if(inside){entered=true;const vs=v-tn*(x-L.cx)/L.gh;if(vs<=S.D){end={x,y};k=1;jx=(x-L.cx)/hw;break;}}
+    else if(entered){end={x,y};k=.3;jx=(x>L.cx?1:-1)*.85;break;}
+  }
+  if(!end)end={x:rx+dx*40,y:ry+dy*40};
+  const T=Math.max(L.W,L.H)*1.6;     // long enough to leave the screen: it comes from above in the real world
+  const g={x0:rx-dx*T,y0:ry-dy*T,x1:end.x,y1:end.y,hit:true,k,jx,rx0:0,ry0:0,rx1:0,ry1:0};
+  if(k<1){  // wall hit: it runs down the glass to where the beer is
+    const xi=end.x+(end.x>L.cx?-1:1)*L.wall*.7,vS=S.D+tn*(xi-L.cx)/L.gh,yS=L.gb+vS*L.gh;
+    if(yS<end.y){g.rx0=xi;g.ry0=end.y;g.rx1=xi;g.ry1=yS;}
+  }
+  return g;
+}
+
+/* ---------- game ---------- */
+const S={gAng:0,gTarget:0,gScale:1,qSum:0,pq:.5,jetX:0,jetK:1,state:'intro',D:0,H:0,time:0,surge:0,pour:0,tPour:0,tSince:0,hold:0,maxTop:0,drinking:false,
+  tilt:0,mode:'button',sipped:false,gulp:0};
+const FASTP=Q.get('fast');const POUR_A=FASTP?.4:7,REST_T=FASTP?.4:8,POUR_C=FASTP?.4:5.5,D_A=.68;
+const store={get(){try{return JSON.parse(localStorage.getItem('stg')||'{}')}catch(e){return{}}},
+  put(o){try{localStorage.setItem('stg',JSON.stringify(o))}catch(e){}}};
+let save=Object.assign({best:null,pints:0,perfect:0,streak:0,bestStreak:0},store.get());
+const msg=$('msg'),main=$('main'),again=$('again'),modeBtn=$('mode');
+function stats(){
+  $('stats').textContent=(save.best==null?'no score yet':'best '+save.best.toFixed(1)+' mm off')+' · pints '+save.pints+' · splits '+save.perfect+(save.streak>1?' · streak '+save.streak:'');}
+function buzz(ms){try{if(window.Android&&Android.vibrate)Android.vibrate(ms);else if(navigator.vibrate)navigator.vibrate(ms);}catch(e){}}
+
+function placeLines(){
+  const dpr=canvas.width/innerWidth;
+  $('lt').style.top=((L.H-(L.gb+GC*L.gh))/dpr)+'px';
+  $('lp').style.top=((L.H-(L.gb+S.D*L.gh))/dpr)+'px';
+}
+function hideLines(){$('lt').style.display=$('lp').style.display='none';}
+
+function setState(s){
+  S.state=s;
+  main.classList.toggle('hidden',false);
+  again.classList.toggle('hidden',!(s==='result'||s==='empty'));
+  if(s==='intro'){main.textContent='POUR A PINT';msg.textContent='Tilt to ~45° and pour to three-quarters,\nlet it settle, top it up, then split the G.';hideLines();}
+  if(s==='pouring'){main.textContent='POURING…';msg.textContent='';main.textContent=S.mode==='tilt'?'ROLL YOUR PHONE TO TILT':'HOLD TO TILT THE GLASS';}
+  if(s==='resting'){S.restMsg='';}
+  if(s==='topping'){main.textContent='TOPPING UP…';msg.textContent=(S.rush>.35?'Rushed it! A real pint takes patience.\n':'')+'Slowly, straight down, to a domed head.';}
+  if(s==='ready'){main.textContent=S.mode==='tilt'?'TILT TO DRINK':'HOLD TO DRINK';
+    msg.textContent='Stop with the dark liquid on the middle of the G.';}
+  if(s==='result'){main.textContent=S.mode==='tilt'?'TILT TO FINISH':'HOLD TO FINISH';}
+  if(s==='empty'){main.classList.add('hidden');}
+}
+function startPour(){
+  S.lipSide=Math.random()<.5?-1:1;S.D=0;S.H=0;S.ang=S.angV=0;S.gAng=S.gTarget=0;S.gScale=1;S.qSum=0;S.pq=.5;S.jetX=0;S.jetK=1;S.time=S.time||0;S.tPour=0;S.surge=1;S.pour=1;S.tSince=0;S.hold=0;S.maxTop=0;S.sipped=false;S.drinking=false;
+  hideLines();clearBubbles();clearFilm();setState('pouring');
+  // clear the sim
+  for(const t of [vel,dye,pressure]){for(const b of [t.read,t.write]){gl.bindFramebuffer(gl.FRAMEBUFFER,b.f);gl.viewport(0,0,b.w,b.h);gl.clear(gl.COLOR_BUFFER_BIT);}}
+}
+function startTop(){S.rush=S.surge;S.tTop=0;S.H0r=S.H;S.Hf=HEAD0*(1-.4*S.rush);setState('topping');}
+function lock(){
+  S.state='result';
+  const err=S.D-GC,mm=Math.abs(err)*GLASS_MM;
+  const pts=Math.max(0,Math.round(100-mm*4));
+  let head,cls;
+  if(S.D<.12){head='Ah, you went and drank it all.';}
+  else if(mm<=2){head='SPLIT THE G! 🍀';}
+  else if(mm<=5){head='So close.';}
+  else if(mm<=10){head='Respectable.';}
+  else if(S.D>GC+.14){head='You barely touched it.';}
+  else head='Sláinte anyway.';
+  const dir=err>0?'too high':'too low';
+  msg.textContent=head+'\n'+mm.toFixed(1)+' mm '+dir+' · '+pts+' pts';
+  save.pints++;if(mm<=2){save.perfect++;save.streak++;}else save.streak=0;
+  save.bestStreak=Math.max(save.bestStreak||0,save.streak);
+  if(save.best==null||mm<save.best)save.best=mm;
+  store.put(save);stats();
+  placeLines();$('lt').style.display=$('lp').style.display='block';
+  buzz(mm<=2?[60,40,60,40,120]:30);
+  setState('result');
+  msg.textContent=head+'\n'+mm.toFixed(1)+' mm '+dir+' · '+pts+' pts';
+}
+
+/* drink input */
+let btnDown=false;
+function drinkRate(){
+  if(S.mode==='tilt'){const t=Math.max(0,Math.min(1,(Math.abs(S.tilt)-14)/38));return .24*t*t;}
+  return btnDown?(.04+.15*smooth(0,2.4,S.hold)):0;}
+const smooth=(a,b,x)=>{x=Math.max(0,Math.min(1,(x-a)/(b-a)));return x*x*(3-2*x);};
+
+main.addEventListener('pointerdown',e=>{e.preventDefault();
+  if(S.state==='intro'){lockPortrait();startPour();return;}
+  if(S.state==='resting'){startTop();return;}
+  btnDown=true;main.classList.add('on');});
+const up=()=>{btnDown=false;main.classList.remove('on');};
+addEventListener('pointerup',up);addEventListener('pointercancel',up);
+again.addEventListener('pointerdown',e=>{e.preventDefault();startPour();});
+function setMode(m,auto){
+  S.mode=m;modeBtn.textContent='CONTROL: '+(m==='tilt'?'TILT PHONE'+(auto?' (AUTO)':''):'BUTTON');
+  if(S.state==='ready'||S.state==='result')setState(S.state);
+  else if(S.state==='pouring')main.textContent=m==='tilt'?'ROLL YOUR PHONE TO TILT':'HOLD TO TILT THE GLASS';
+}
+modeBtn.addEventListener('pointerdown',e=>{e.preventDefault();
+  S.userMode=true;
+  const m=S.mode==='button'?'tilt':'button';
+  if(m==='tilt'){lockPortrait();
+    if(typeof DeviceOrientationEvent!=='undefined'&&DeviceOrientationEvent.requestPermission)DeviceOrientationEvent.requestPermission().catch(()=>{});}
+  setMode(m);if(m==='tilt')checkTilt();});
+addEventListener('deviceorientation',e=>{if(e.gamma!=null&&e.beta!=null&&!S.userMode&&S.mode!=='tilt')setMode('tilt',true);
+  if(e.gamma!=null){S.accel=Math.max(-60,Math.min(60,(e.gamma-S.tilt)*-4));S.tilt=e.gamma;S.gotTilt=true;if(S.mode==='tilt')modeBtn.textContent='TILT '+Math.round(e.gamma)+'°';}});
+function checkTilt(){setTimeout(()=>{if(S.mode==='tilt'&&!S.gotTilt)msg.textContent='No tilt sensor data. '+(isSecureContext?'Is motion access blocked for this site?':'Chrome blocks sensors on http:// pages - see chrome://flags/#unsafely-treat-insecure-origin-as-secure');},1200);}
+
+function lockPortrait(){
+  try{const d=document.documentElement;
+    const go=()=>screen.orientation&&screen.orientation.lock&&screen.orientation.lock('portrait-primary').catch(()=>{});
+    if(!document.fullscreenElement&&d.requestFullscreen)d.requestFullscreen({navigationUI:'hide'}).then(go).catch(go);else go();}catch(e){}}
+function rotCheck(){$('rot').style.display=innerWidth>innerHeight&&matchMedia('(pointer:coarse)').matches?'flex':'none';}
+addEventListener('resize',rotCheck);rotCheck();
+// first touch anywhere: go fullscreen and lock portrait (Chrome only allows the lock while fullscreen)
+addEventListener('pointerdown',()=>lockPortrait(),{once:true});
+/* stir the stout with a finger */
+let lastP=null;
+canvas.addEventListener('pointerdown',e=>{lastP={x:e.clientX,y:e.clientY};});
+canvas.addEventListener('pointermove',e=>{
+  if(!lastP||!vel)return;
+  const dx=e.clientX-lastP.x,dy=e.clientY-lastP.y;lastP={x:e.clientX,y:e.clientY};
+  const x=e.clientX/innerWidth,y=1-e.clientY/innerHeight;
+  splat(vel,x,y,dx*8,-dy*8,0,.0009);
+});
+addEventListener('pointerup',()=>{lastP=null;});
+
+/* main loop */
+let last=performance.now(),acc=0;
+function frame(now){
+  requestAnimationFrame(frame);
+  let dt=Math.min((now-last)/1000,1/30);last=now;if(dt<=0)return;tick(dt);}
+function tick(dt,skip){
+  {const tgt=(S.gAng||0)+(S.state==='pouring'?0:S.mode==='tilt'?Math.max(-.62,Math.min(.62,S.tilt*Math.PI/180)):(btnDown&&(S.state==='ready'||S.state==='result')?.22*smooth(0,.8,S.hold+.01):0));
+   S.angV=(S.angV||0)+(70*(tgt-(S.ang||0))-13*(S.angV||0))*dt;S.ang=(S.ang||0)+S.angV*dt;}
+  if(S.state!=='pouring'){S.gAng+=(0-S.gAng)*Math.min(1,5*dt);S.gScale+=(1-S.gScale)*Math.min(1,4*dt);}
+  S.time+=dt;S.accel=(S.accel||0)*Math.exp(-dt*8);
+  if(S.state==='pouring'){            // 1. YOU tilt the glass; stream falls vertically from above
+    if(S.mode==='tilt')S.gTarget=Math.max(-1.4,Math.min(1.4,S.tilt*Math.PI/180));
+    else S.gTarget=Math.max(0,Math.min(1.4,(S.gTarget||0)+(btnDown?.61:-1.05)*dt));
+    S.gAng+=(S.gTarget-S.gAng)*Math.min(1,7*dt);
+    S.sg=streamGeom();S.jetX=S.sg.jx;S.jetK=S.sg.k;
+    const deg=Math.abs(S.gAng)*57.3,q=1-Math.min(1,Math.abs(deg-45)/35);
+    S.qSum+=q*dt;S.tPour+=dt;S.pour=1;S.surge=1;
+    if(S.sg.hit)S.D+=(D_A/POUR_A)*dt;
+    const dmax=.985-Math.abs(Math.tan(S.gAng))*(L.hwTop/L.gh)*.95;
+    const spill=S.D>dmax;if(spill)S.D=Math.max(dmax,S.D-.3*dt);
+    S.H+=((.03+.06*(1-q))*smooth(.1,.4,S.D)-S.H)*Math.min(1,dt);
+    const tip=spill?'Spilling! Too steep, tilt back.':!S.sg.hit?'Missing the glass!':deg<30?'Too upright. It will go foamy, tilt more.':deg<=54?'Perfect, the stream runs down the side.':'Getting steep, ease back.';
+    const m='Angle '+Math.round(deg)+'°  ·  '+tip;if(m!==S.pMsg){S.pMsg=m;msg.textContent=m;}
+    if(S.D>=D_A-.003){S.D=D_A;S.pour=0;S.pq=S.qSum/Math.max(S.tPour,.1);S.tRest=0;setState('resting');}
+  }else if(S.state==='resting'){      // 2. short settle
+    S.tRest+=dt;S.surge=Math.exp(-S.tRest/3.4);S.pour=0;S.jetK=1;S.jetX=0;
+    S.H+=((.07+.03*(1-S.pq))-S.H)*Math.min(1,.7*dt);
+    const left=Math.max(0,Math.ceil(REST_T-S.tRest));
+    const m=(S.pq>=.75?'Beautiful pour. ':S.pq<.4?'Too steep or too upright, so it\'s foamy. ':'')+(left>0?'Let it settle… '+left+'s':'Settled. Now top it up to the rim.');
+    if(m!==S.restMsg){S.restMsg=m;msg.textContent=m;main.textContent=left>0?'TOP UP NOW (TOO EARLY?)':'TOP IT UP';}
+  }else if(S.state==='topping'){      // 3. slow straight pour to a domed head
+    S.tTop+=dt;const k=Math.min(1,S.tTop/POUR_C),e=smooth(0,1,k);
+    S.D=D_A+(FILL-D_A)*e;S.H=S.H0r+(S.Hf-S.H0r)*e;S.pour=k<1?.7:0;S.jetX=0;S.jetK=.6;S.gTarget=0;S.sg=streamGeom();S.surge=Math.max(S.surge,.3*(1-k*.3));
+    if(k>=1){S.pour=0;S.tSince=0;setState('ready');if(Q.get('d')){S.maxTop=S.D+S.H+.01;S.D=+Q.get('d');}}
+  }else if(S.state!=='intro'){
+    S.tSince+=dt;S.surge=.3*Math.exp(-S.tSince/5);
+  }
+  if(S.state==='ready'||S.state==='result'||S.state==='empty'){
+    S.maxTop=Math.max(S.maxTop,S.D+S.H+.01);
+    S.H=Math.max(.02,S.H-(S.H-.02)*dt/70);   // head slowly collapses
+  }
+  if(S.state==='ready'||S.state==='result'){
+    const r=drinkRate();
+    if(r>0){
+      S.drinking=true;if(S.mode==='tilt'&&Math.abs(S.tilt)>10)S.lipSide=Math.sign(S.tilt);S.hold+=dt;S.sipped=true;
+      const dd=Math.min(r*dt,S.D-.04>0?S.D-.04:0);
+      S.D-=dd;S.H=Math.max(.02,S.H-dd*.15);
+      
+      // sloshing at the surface
+      const x=.5+(Math.random()-.5)*.25,y=(L.gb+S.D*L.gh)/L.H;
+      splat(vel,x,y,(Math.random()-.5)*4,-2,0,.0014);
+      if(S.state==='result')placeLines();
+      if(S.D<=.041){ if(S.state==='ready'){lock();} setState('empty');msg.textContent=(S.state==='empty'&&save.pints?msg.textContent.split('\n')[0]+'\n':'')+'Empty. Sláinte! 🍺';buzz(200);}
+    }else{
+      S.hold=0;
+      if(S.drinking){S.drinking=false;if(S.state==='ready'&&S.sipped)lock();}
+    }
+  }
+  if(!vel)return;
+  if(Q.get('sip')&&S.state==='ready'){S.sipT=(S.sipT||0)+dt;btnDown=S.sipT>.6;} else if(Q.get('sip')&&S.state==='result'){btnDown=(S.sipT+=dt)<3.2;}
+  if(skip){waveStep(dt);filmStep(dt);return;}
+  waveStep(dt);filmStep(dt);simStep(dt);render();
+}
+
+/* ---------- boot ---------- */
+makeG();resize();stats();setState('intro');
+requestAnimationFrame(t=>{last=t;frame(t);});
+
+/* test hooks (headless screenshots) */
+window.__t={S,startPour,lock,setState,get L(){return L;},press(v){btnDown=v;}};
+const auto=Q.get('auto');
+if(auto){setTimeout(startPour,50);}
+if(Q.get('tilt')){S.mode='tilt';S.tilt=+Q.get('tilt');S.gotTilt=true;}
+if(Q.get('fast')){window.__fast=1;}
+window.__adv=(sec,fn)=>{for(let t=0;t<sec;t+=1/30){if(fn)fn(t);tick(1/30,true);}};
+if(Q.get('script')){setTimeout(()=>{const log=[];startPour();
+  const snap=l=>log.push(l+':'+S.state+' D'+S.D.toFixed(2)+' H'+S.H.toFixed(2)+' su'+S.surge.toFixed(2));
+  __adv(3);snap('3s');__adv(4);snap('7s');__adv(12);snap('19s');startTop();__adv(2);snap('top2s');__adv(5);snap('top7s');__adv(1);snap('ready');
+  __adv(10);snap('+10');document.title=log.join(' | ');},300);}
+if(Q.get('pshot')){setTimeout(()=>{S.mode='button';startPour();const T=+Q.get('pshot'),hold=Q.get('hold')!=='0';
+  __adv(T,()=>{btnDown=hold&&S.gTarget<.78;});
+  for(let i=0;i<10;i++){simStep(1/30);}render();
+  document.title=S.state+' D'+S.D.toFixed(2)+' ang'+(S.gAng*57.3).toFixed(0)+' hit'+S.sg.hit+' k'+S.sg.k+' pq'+(S.qSum/Math.max(S.tPour,.1)).toFixed(2);},300);}
+if(Q.get('dbg'))setInterval(()=>{document.title=S.state+' D='+S.D.toFixed(2)+' H='+S.H.toFixed(2)+' surge='+S.surge.toFixed(2);},100);
+if(Q.get('autotop'))setInterval(()=>{if(S.state==='resting'&&S.tRest>=REST_T)startTop();},100);
+if(Q.get('simb')){const T=+Q.get('simb');setTimeout(()=>{startPour();S.state='ready';S.D=.86;S.H=.1;S.maxTop=.97;S.surge=1;S.tSince=0;
+  const dt=1/30;let t=0;for(;t<T;t+=dt){S.time+=dt;S.surge=Math.exp(-t/5.5);
+    if(t>1&&S.D>.52&&t<4){S.D-=.17*dt;S.H=Math.max(.02,S.H-.1*dt*.15);}
+    S.H=Math.max(.02,S.H-(S.H-.02)*dt/70);if(t>1)filmStep(dt);}
+  document.title='film';},300);}
+</script>
+</body>
+</html>

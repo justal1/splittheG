@@ -1,0 +1,10 @@
+{
+  "name": "Split the G",
+  "short_name": "Split the G",
+  "start_url": "index.html",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#050806",
+  "theme_color": "#050806",
+  "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
+}
