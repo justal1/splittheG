@@ -131,13 +131,15 @@ void main(){float L=texture(uPressure,vL).x,R=texture(uPressure,vR).x,T=texture(
 vec2 v=texture(uVelocity,vUv).xy-vec2(R-L,T-B);o=vec4(v,0.,1.);}`;
 
 /* the Guinness "surge": bubbles stream DOWN the walls, drift UP the middle */
-F.force=HEAD+GLASS+`in vec2 vUv;uniform sampler2D uVelocity;uniform float dt,uSurge,uPour,uAccel,uJetX,uJetK;out vec4 o;
+F.force=HEAD+GLASS+`in vec2 vUv;uniform sampler2D uVelocity,uDye;uniform float dt,uSurge,uPour,uAccel,uJetX,uJetK;out vec4 o;
 void main(){vec2 vel=texture(uVelocity,vUv).xy;vec2 p=vUv*uRes;float v=vAt(p);
 float sg=(p.x-uGlass.x)/hwAt(v);float s=abs(sg);
 float liq=step(v,uD)*step(uBase,v);
 float down=smoothstep(.40,.92,s),up=1.-smoothstep(0.,.5,s);
 float fx0=0.;
-float fy=(-down*1.+up*.62)*16.*uSurge;
+float bub=min(texture(uDye,vUv).r,1.2);
+float fy=(-down*1.+up*.40)*16.*uSurge;
+fy+=bub*(1.-.5*down)*20.*step(v,uD);   // buoyancy: bubble-laden beer is lighter and rises, the clear beer beside it sinks
 float jet=(1.-smoothstep(0.,.30,abs(sg-uJetX)))*smoothstep(uD-.55,uD,v);
 fy+=-150.*uPour*uJetK*jet;
 // turbulent churn: big noisy forces everywhere under the surface while pouring
@@ -234,7 +236,8 @@ void main(){
       float lvl=uD+wob;
       float rim=pow(clamp(asx,0.,1.),3.);
       // dark ruby stout
-      vec3 stout=mix(vec3(.010,.006,.005),vec3(.26,.075,.028),pow(clamp(asx,0.,1.),2.2)*.9);
+      float path=sqrt(max(1.-sx*sx,0.));                                   // light path through the round glass
+      vec3 stout=vec3(1.3,.8,.45)*exp(-vec3(5.5,8.,16.)*path)+vec3(.008,.005,.004);   // Beer-Lambert: black in the middle, ruby at the edges
       float dsurf=max(uD-vs,0.);
       stout=mix(vec3(.105,.034,.014),stout,smoothstep(.0,.07,dsurf));   // thin backlit ruby layer under the surface
       stout+=vec3(.03,.018,.01)*(1.-v)*.4;
@@ -273,6 +276,13 @@ void main(){
     // glass highlights
     float hl=smoothstep(.07,.0,abs(sx+.80))*.12+smoothstep(.04,.0,abs(sx-.86))*.16+smoothstep(.02,.0,abs(sx+.62))*.05;
     c+=hl*vec3(.8,.9,.95)*(v>uBase?1.:.3);
+    // window reflection sliding across the glass as the room tilts, plus Fresnel at the grazing edges
+    float wr=smoothstep(.16,.0,abs(sx+.42-uRot.w*1.1))*smoothstep(.0,.25,v)*smoothstep(1.,.7,v);
+    c+=vec3(.55,.62,.68)*wr*.07*(1.-.6*step(v,uD));
+    c+=vec3(.42,.5,.52)*pow(clamp(asx,0.,1.),5.)*.16;
+    // thick base: refracts the bar and focuses a warm caustic through the glass
+    if(v<uBase){float bt=v/uBase;vec3 lens=bg(pb+vec2(sx*uHwTop*.35,uGlass.z*uBase*.8));
+      c=mix(c,lens*.8+vec3(.03),.55)+vec3(.9,.5,.2)*exp(-sx*sx*14.)*.12*(1.-bt);}
     c+=vec3(.5,.62,.6)*smoothstep(1.2*uWall,.0,abs(abs(p.x-uGlass.x)-hw))*.5;     // outline
     c+=vec3(.6,.7,.7)*smoothstep(.006,.0,abs(v-1.))*.5;                               // rim
     // printed G on the glass
@@ -299,6 +309,7 @@ void main(){
         float a=smoothstep(w,w*.5,abs(dx))*uPour*.85;
         col=mix(col,vec3(.05,.025,.015)+vec3(.25,.1,.05)*smoothstep(.2,-.6,dx/w)*.5,a);}}
   }
+  col=col/(1.+.18*max(col-.75,0.));            // soft highlight shoulder
   col+=(hash(p+uTime)-.5)/200.;
   o=vec4(col,1.);}`;
 
@@ -394,7 +405,7 @@ function splat(target,x,y,r,g,b,rad){
 function simStep(dt){
   const sx=vel.tx,sy=vel.ty;
   // surge forces
-  use(P.force);setGlass();set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);
+  use(P.force);setGlass();set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);tex('uDye',dye.read.t,1);
   set1('dt',dt);set1('uSurge',S.surge);set1('uPour',S.pour);set1('uAccel',S.accel||0);set1('uJetX',S.jetX||0);set1('uJetK',S.jetK==null?1:S.jetK);blit(vel.write);vel.swap();
   use(P.curl);set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);blit(curlT);
   use(P.vort);set2('texelSize',sx,sy);tex('uVelocity',vel.read.t,0);tex('uCurl',curlT.t,1);set1('curl',26);set1('dt',dt);
@@ -656,7 +667,7 @@ function lock(){
   if(save.best==null||mm<save.best)save.best=mm;
   store.put(save);stats();
   placeLines();$('lt').style.display=$('lp').style.display='block';
-  buzz(mm<=2?[60,40,60,40,120]:30);
+  buzz(mm<=2?[60,40,60,40,120]:30);clink();
   setState('result');
   msg.textContent=head+'\n'+mm.toFixed(1)+' mm '+dir+' · '+pts+' pts';
 }
@@ -708,6 +719,45 @@ canvas.addEventListener('pointermove',e=>{
   splat(vel,x,y,dx*8,-dy*8,0,.0009);
 });
 addEventListener('pointerup',()=>{lastP=null;});
+
+
+/* ---------- sound (synthesised) + haptics ---------- */
+const AU={ctx:null,on:!Q.get('mute')};
+function audioInit(){
+  if(AU.ctx||!AU.on)return;
+  try{const C=new (window.AudioContext||window.webkitAudioContext)();AU.ctx=C;
+    const nb=(len,fn)=>{const b=C.createBuffer(1,C.sampleRate*len,C.sampleRate),d=b.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=fn(i);return b;};
+    const loop=(buf)=>{const s=C.createBufferSource();s.buffer=buf;s.loop=true;s.start();return s;};
+    // pour: band-passed noise whose pitch rises as the glass fills (shorter air column)
+    const pn=loop(nb(2,()=>Math.random()*2-1));AU.pf=C.createBiquadFilter();AU.pf.type='bandpass';AU.pf.Q.value=.9;AU.pf.frequency.value=700;
+    AU.pg=C.createGain();AU.pg.gain.value=0;pn.connect(AU.pf).connect(AU.pg).connect(C.destination);
+    // fizz: sparse clicks through a high-pass
+    const fn_=loop(nb(3,()=>Math.random()<.004?(Math.random()*2-1):0));const fh=C.createBiquadFilter();fh.type='highpass';fh.frequency.value=2600;
+    AU.fg=C.createGain();AU.fg.gain.value=0;fn_.connect(fh).connect(AU.fg).connect(C.destination);
+    AU.noise=nb(1,()=>Math.random()*2-1);
+  }catch(e){AU.ctx=null;}
+}
+function tone(f0,f1,dur,vol,type){const C=AU.ctx;if(!C)return;const t=C.currentTime,o=C.createOscillator(),g=C.createGain();
+  o.type=type||'sine';o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(f1,t+dur);
+  g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(.0001,t+dur);o.connect(g).connect(C.destination);o.start(t);o.stop(t+dur+.02);}
+function gulp(){const C=AU.ctx;if(!C)return;const t=C.currentTime,s=C.createBufferSource(),f=C.createBiquadFilter(),g=C.createGain();
+  s.buffer=AU.noise;f.type='lowpass';f.frequency.setValueAtTime(900,t);f.frequency.exponentialRampToValueAtTime(180,t+.22);
+  g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.35,t+.04);g.gain.exponentialRampToValueAtTime(.0001,t+.25);
+  s.connect(f).connect(g).connect(C.destination);s.start(t,Math.random()*.5,.3);tone(190,95,.2,.25);}
+function clink(){tone(2900,2850,.5,.12);tone(4350,4300,.35,.07);tone(1830,1800,.7,.06);}
+let gulpT=0,buzzT=0;
+function audioUpdate(dt){
+  if(AU.ctx){const t=AU.ctx.currentTime;
+    const pour=(S.state==='pouring'||S.state==='topping')?S.pour:0;
+    AU.pg.gain.setTargetAtTime(pour*(.18+.1*(S.sg&&S.sg.k<1?1:0)),t,.08);
+    AU.pf.frequency.setTargetAtTime(500+900*S.D+300*(1-S.pq),t,.1);
+    AU.fg.gain.setTargetAtTime(.28*Math.min(1,S.surge)*(S.state==='intro'?0:1),t,.3);
+    if(S.drinking){gulpT-=dt;if(gulpT<=0){gulp();gulpT=.55+Math.random()*.2;}}else gulpT=0;
+  }
+  // haptics: a gentle rumble while pouring and while the surge is strong
+  buzzT-=dt;if(buzzT<=0){const lvl=(S.state==='pouring'||S.state==='topping')?S.pour:S.surge>.5?.5:0;if(lvl>0){buzz(Math.round(8+10*lvl));buzzT=.14;}}
+}
+addEventListener('pointerdown',audioInit,{once:true});
 
 /* main loop */
 let last=performance.now(),acc=0;
@@ -767,6 +817,7 @@ function tick(dt,skip){
       if(S.drinking){S.drinking=false;if(S.state==='ready'&&S.sipped)lock();}
     }
   }
+  if(!skip)audioUpdate(dt);
   if(!vel)return;
   if(Q.get('sip')&&S.state==='ready'){S.sipT=(S.sipT||0)+dt;btnDown=S.sipT>.6;} else if(Q.get('sip')&&S.state==='result'){btnDown=(S.sipT+=dt)<3.2;}
   if(skip){waveStep(dt);filmStep(dt);return;}
